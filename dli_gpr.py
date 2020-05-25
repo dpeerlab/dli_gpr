@@ -22,7 +22,7 @@ class dli_gpr:
         lamb (float): initial value of kernel bandwidth
     """
     def __init__(self, y:torch.tensor, t:torch.tensor, 
-        cluster_sizes:torch.tensor, lamb = None):
+        cluster_sizes:torch.tensor, lamb=None):
 
         # Number of observations
         self.n = len(y)
@@ -36,16 +36,18 @@ class dli_gpr:
         # Number of cells in each time point
         self.cluster_sizes = cluster_sizes
 
-        # Lambda: kernel bandwidth
-        self.lamb = lamb
-
         # if None, set to median distance between time points
-        if self.lamb is None:
+        if lamb is None:
             y_unsqueezed = self.y.unsqueeze(-1)
             self.lamb = torch.median(((y_unsqueezed - y_unsqueezed.T).pow(2)).pow(0.5))
+        else:
+            # Lambda: kernel bandwidth
+            self.lamb = torch.tensor(lamb)
 
         # initial value to use as shape parameter for Gamma distribution
-        self.gam = torch.FloatTensor([1.])
+        # initialize gamma with the square standard error
+        # self.gam = len(t) / torch.var(t)
+        self.gam = torch.tensor(1.)
 
     def initialize_variables(self, jitter=1e-5):
         """Initialize the kernel matrix and noise prior
@@ -112,10 +114,10 @@ class dli_gpr:
             losses.append(loss)
         
         # save precisions
-        self.beta = pyro.param("a").detach() / pyro.param("b").detach()
+        self.gam = pyro.param("a").detach()
 
         # save noise variances
-        self.beta_inverse = 1./ self.beta
+        self.beta_inverse = pyro.param("b").detach()
 
         return losses
 
@@ -125,19 +127,20 @@ class dli_gpr:
 
         # compute kernel for original and new observations
         k = gaussian_kernel(self.y, self.lamb, new_y)
-        c = gaussian_kernel(new_y, self.lamb)
+        c = gaussian_kernel(new_y, self.lamb) + 1./self.gam * torch.eye(len(new_y))
 
         # compute inverse covariance
         precision = torch.inverse(self.scale + torch.diag(self.beta_inverse))
+        # precision = torch.inverse(self.scale + 1e-5 * torch.eye(self.scale.shape[0]))
 
         # compute mean
         mean = k.T @ precision @ (self.t_centered) + self.t_mean
 
         # compute covariance
-        empirical_variance = torch.var(mean)
+        # empirical_variance = torch.var(mean)**0.5
         # empirical_variance = torch.mean(self.beta_inverse)
-        # empirical_variance = self.gam
-        cov = (c + empirical_variance * torch.eye(len(new_y))) - k.T @ precision @ k
+        cov = c - k.T @ precision @ k
+        #cov = (c) - k.T @ precision @ k
 
         return mean, cov
 
