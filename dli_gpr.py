@@ -46,8 +46,8 @@ class dli_gpr:
 
         # initial value to use as shape parameter for Gamma distribution
         # initialize gamma with the square standard error
-        # self.gam = len(t) / torch.var(t)
-        self.gam = torch.tensor(1.)
+        self.gam = len(t) / torch.var(t)
+        # self.gam = torch.tensor(1.)
 
     def initialize_variables(self, jitter=1e-5):
         """Initialize the kernel matrix and noise prior
