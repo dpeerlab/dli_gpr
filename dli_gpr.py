@@ -1,3 +1,10 @@
+"""Implementation of GP regression (vanilla and hierarchical model for heteroskedascic noise)
+
+Todo: model methods are rather unintuitive.
+Should modify at some point to imitate sklearn models (with fit, fit_transform, predict methods)
+Should also hide initialize variables method
+"""
+
 import pyro
 import pyro.distributions as dist
 import torch
@@ -11,6 +18,119 @@ def gaussian_kernel(x, lamb, x2=None):
         x2 = x.unsqueeze(-1)
     x = x.unsqueeze(-1)
     return torch.exp(-(x - x2.T).pow(2) / lamb**2)
+
+class gpr:
+    """Vanilla GPR model
+
+    Attributes:
+        y: 1D tensor of time points
+        t: 1D tensor of responses
+        lamb: kernel bandwidth
+        sigma: noise variance
+    """
+    def __init__(self, y:torch.tensor, t:torch.tensor, lamb=None, sigma=None):
+        """Constructor: inputs are y and t
+        By default, lambda and sigma are inferred from the data but can also be provided
+        """
+        assert len(y) == len(t), "Lengths of y and t are not equal"
+
+        # number of observations
+        self.n = len(y)
+        self.y = y # time points
+        self.t = t # response variables
+
+        # if lambda is not given, set it to the median distance between all pairs of points
+        if lamb is None:
+            y_unsqueezed = self.y.unsqueeze(-1)
+            self.lamb = torch.median(((y_unsqueezed - y_unsqueezed.T).pow(2)).pow(0.5))
+        else:
+            self.lamb = torch.tensor(lamb)
+
+        # if sigma is not given, set it to the squared standard error
+        if sigma is None:
+            self.sigma = torch.var(t) / self.n
+        else:
+            self.sigma = torch.tensor(sigma)
+
+    def initialize_variables(self, jitter=1e-6):
+        """Initializes kernel matrix
+        """
+        # set Gaussian kernel
+        self.scale = gaussian_kernel(self.y, self.lamb)
+
+        # cholesky decomp
+        self.scale_tril = torch.cholesky(self.scale + jitter * torch.eye(self.n))
+
+        # center response variable
+        self.t_centered = self.t - torch.mean(self.t)
+
+        # store mean
+        self.t_mean = torch.mean(self.t)
+
+    def model(self):
+        """Generative model
+
+        Sample f from N(O,K)
+        Sample t from N(f, sigma)
+
+        There is really no "learning" because we can use conditional Gaussian
+        """
+        sigma = pyro.param("sigma", self.sigma, constraint=constraints.positive)
+        f = pyro.sample("f", dist.MultivariateNormal(torch.zeros(self.n), scale_tril=self.scale_tril))
+
+        # compute likelihood for observation, using beta as observation precision
+        pyro.sample("y", dist.MultivariateNormal(f, 
+            covariance_matrix=torch.eye(self.n) * sigma), 
+            obs=self.t_centered)
+
+    def guide(self):
+        """Guide (not really anything to do here)"""
+        pass
+
+    def optimize(self, n_steps:int=1):
+        """Run SVI for user-specified number of steps. Usually 1000 is good. 
+        Returns (list) of ELBO loss associated with each step"""
+
+        # use Adam optimizer
+        optimizer = pyro.optim.Adam({"lr": 0.001})
+
+        # ELBO loss
+        loss = pyro.infer.Trace_ELBO()
+
+        # approximate inference with ADVI
+        svi = pyro.infer.SVI(self.model, self.guide, optimizer, loss)
+
+        losses = []
+        for step in tqdm.tqdm(range(n_steps)):
+            loss = svi.step()
+            losses.append(loss)
+        
+        # save noise
+        self.sigma = pyro.param("sigma").detach()
+
+        return losses
+
+    def conditional_distribution(self, new_y):
+        """Compute conditional distribution of t given observations and some new input points y
+        Returns mean and covariance of conditional distribution"""
+
+        # compute kernel for original and new observations
+        k = gaussian_kernel(self.y, self.lamb, new_y)
+        c = gaussian_kernel(new_y, self.lamb) + self.sigma * torch.eye(len(new_y))
+
+        # compute inverse covariance
+        precision = torch.inverse(self.scale + self.sigma * torch.eye(self.n))
+        # precision = torch.inverse(self.scale + 1e-6 * torch.eye(self.n))
+
+        # compute mean
+        mean = k.T @ precision @ (self.t_centered) + self.t_mean
+
+        # compute covariance
+        cov = c - k.T @ precision @ k
+
+        #print(k.T @ precision @ k)
+        return mean, cov
+
 
 class dli_gpr:
     """ Implementation of Gaussian Process regression with non-isotropic noise
