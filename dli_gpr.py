@@ -12,12 +12,12 @@ from torch.distributions import constraints
 
 import tqdm
 
-def gaussian_kernel(x, lamb, x2=None):
+def gaussian_kernel(x, lamb, x2=None, scale=1.0):
     """Compute gaussian kernel for 1D tensor"""
     if x2 is None:
         x2 = x.unsqueeze(-1)
     x = x.unsqueeze(-1)
-    return torch.exp(-(x - x2.T).pow(2) / lamb**2)
+    return scale * torch.exp(-(x - x2.T).pow(2) / lamb**2)
 
 class gpr:
     """Vanilla GPR model
@@ -27,8 +27,9 @@ class gpr:
         t: 1D tensor of responses
         lamb: kernel bandwidth
         sigma: noise variance
+        scale: kernel scale
     """
-    def __init__(self, y:torch.tensor, t:torch.tensor, lamb=None, sigma=None):
+    def __init__(self, y:torch.tensor, t:torch.tensor, lamb=None, sigma=None, scale=None):
         """Constructor: inputs are y and t
         By default, lambda and sigma are inferred from the data but can also be provided
         """
@@ -48,15 +49,20 @@ class gpr:
 
         # if sigma is not given, set it to the squared standard error
         if sigma is None:
-            self.sigma = torch.var(t) / self.n
+            self.sigma = torch.var(t) #/ self.n
         else:
             self.sigma = torch.tensor(sigma)
+
+        if scale is None:
+            self.sc = torch.var(t)**0.5
+        else:
+            self.sc = torch.tensor(scale)
 
     def initialize_variables(self, jitter=1e-6):
         """Initializes kernel matrix
         """
         # set Gaussian kernel
-        self.scale = gaussian_kernel(self.y, self.lamb)
+        self.scale = gaussian_kernel(self.y, self.lamb, scale=self.sc)
 
         # cholesky decomp
         self.scale_tril = torch.cholesky(self.scale + jitter * torch.eye(self.n))
@@ -67,7 +73,7 @@ class gpr:
         # store mean
         self.t_mean = torch.mean(self.t)
 
-    def model(self):
+    def model(self, jitter=1e-4):
         """Generative model
 
         Sample f from N(O,K)
@@ -76,6 +82,7 @@ class gpr:
         There is really no "learning" because we can use conditional Gaussian
         """
         sigma = pyro.param("sigma", self.sigma, constraint=constraints.positive)
+
         f = pyro.sample("f", dist.MultivariateNormal(torch.zeros(self.n), scale_tril=self.scale_tril))
 
         # compute likelihood for observation, using beta as observation precision
@@ -115,8 +122,10 @@ class gpr:
         Returns mean and covariance of conditional distribution"""
 
         # compute kernel for original and new observations
-        k = gaussian_kernel(self.y, self.lamb, new_y)
-        c = gaussian_kernel(new_y, self.lamb) + self.sigma * torch.eye(len(new_y))
+        k = gaussian_kernel(self.y, self.lamb, new_y, scale=self.sc)
+
+        # use noiseless distribution
+        c = gaussian_kernel(new_y, self.lamb, scale=self.sc) #+ self.sigma * torch.eye(len(new_y))
 
         # compute inverse covariance
         precision = torch.inverse(self.scale + self.sigma * torch.eye(self.n))
@@ -142,7 +151,7 @@ class dli_gpr:
         lamb (float): initial value of kernel bandwidth
     """
     def __init__(self, y:torch.tensor, t:torch.tensor, 
-        cluster_sizes:torch.tensor, lamb=None):
+        cluster_sizes:torch.tensor, lamb=None, gam=None, scale=None):
 
         # Number of observations
         self.n = len(y)
@@ -165,9 +174,14 @@ class dli_gpr:
             self.lamb = torch.tensor(lamb)
 
         # initial value to use as shape parameter for Gamma distribution
-        # initialize gamma with the square standard error
-        self.gam = len(t) / torch.var(t)
-        # self.gam = torch.tensor(1.)
+        # initialize gamma with the square standard error (doesn't really matter, we optimize this)
+        self.gam = 1. / torch.var(t)
+        
+        # scale of Gaussian kernel (just set to variance of the data)
+        if scale is None:
+            self.sc = torch.var(t)**0.5
+        else:
+            self.sc = torch.tensor(scale)
 
     def initialize_variables(self, jitter=1e-5):
         """Initialize the kernel matrix and noise prior
@@ -177,18 +191,22 @@ class dli_gpr:
         self.t_centered = self.t - self.t_mean
 
         # covariance matrix
-        self.scale = gaussian_kernel(self.y, self.lamb)
+        self.scale = gaussian_kernel(self.y, self.lamb, scale=self.sc)
         self.scale_tril = torch.cholesky(self.scale + torch.eye(self.n) * jitter)
 
+        # precision
+        self.beta = self.cluster_sizes * self.n / torch.sum(self.cluster_sizes)
+        self.beta_inverse = 1/self.beta
+
         # compute inverse cluster sizes for gamma prior
-        inverse_cluster_sizes = 1./self.cluster_sizes
+        #inverse_cluster_sizes = 1./self.cluster_sizes
 
         # rate parameter for Gamma prior (beta inverse ~ variance of observations. Want lower beta_inverse for bigger clusters)
         # initialize beta so that the MEAN of the gamma prior is proportional to the inverse weights of best linear unbiased estimator
-        self.beta_inverse = inverse_cluster_sizes / torch.sum(inverse_cluster_sizes) * self.n
+        #self.beta_inverse = inverse_cluster_sizes / torch.sum(inverse_cluster_sizes) * self.n
 
         # beta is proportional to the expected precision 
-        self.beta = 1./self.beta_inverse
+        #self.beta = 1./self.beta_inverse
 
     def model(self):
         """Generative process"""
@@ -246,11 +264,13 @@ class dli_gpr:
         Returns mean and covariance of conditional distribution"""
 
         # compute kernel for original and new observations
-        k = gaussian_kernel(self.y, self.lamb, new_y)
-        c = gaussian_kernel(new_y, self.lamb) + 1./self.gam * torch.eye(len(new_y))
+        k = gaussian_kernel(self.y, self.lamb, new_y, scale=self.sc)
+
+        # use noiseless distribution
+        c = gaussian_kernel(new_y, self.lamb, scale=self.sc) + 1./self.gam * torch.eye(len(new_y))
 
         # compute inverse covariance
-        precision = torch.inverse(self.scale + torch.diag(self.beta_inverse))
+        precision = torch.inverse(self.scale + torch.diag(self.beta_inverse/self.gam))
         # precision = torch.inverse(self.scale + 1e-5 * torch.eye(self.scale.shape[0]))
 
         # compute mean
