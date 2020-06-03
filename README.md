@@ -9,7 +9,7 @@ The following packages are required to run the demo notebooks. They are also spe
 matplotlib
 numpy
 pandas
-pytorch
-pyro
+torch
+pyro-ppl
 tqdm
 ```
